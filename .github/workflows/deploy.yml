@@ -1,0 +1,697 @@
+name: Deploy Next.js Website
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Choose deployment operation"
+        required: true
+        type: choice
+        options:
+          - deploy
+          - update_domains
+          - renew_ssl
+
+      primary_domain:
+        description: "Primary domain"
+        required: false
+        type: string
+
+      additional_domains:
+        description: "Additional domains (comma-separated)"
+        required: false
+        type: string
+
+      redirect_aliases:
+        description: "Redirect additional domains to primary domain?"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Serialises runs of the same repository. Cross-repository safety is handled
+# by a flock on the VPS (see the remote script).
+concurrency:
+  group: vps-deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check required secrets
+        env:
+          OPERATION: ${{ inputs.operation }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+          CERTBOT_EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+        run: |
+          missing=0
+          required="VPS_HOST VPS_USER VPS_PASSWORD"
+          if [ "$OPERATION" != "renew_ssl" ]; then
+            required="$required CERTBOT_EMAIL"
+          fi
+          for name in $required; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing GitHub secret: $name"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+      # ------------------------------------------------------------------
+      # Build and package (deploy only)
+      # ------------------------------------------------------------------
+
+      - name: Checkout repository
+        if: ${{ inputs.operation == 'deploy' }}
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ inputs.operation == 'deploy' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        if: ${{ inputs.operation == 'deploy' }}
+        run: npm ci
+
+      - name: Build Next.js application
+        if: ${{ inputs.operation == 'deploy' }}
+        run: npm run build
+
+      - name: Package standalone build
+        if: ${{ inputs.operation == 'deploy' }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f ".next/standalone/server.js" ]; then
+            echo "::error::.next/standalone/server.js not found. Set output: 'standalone' in next.config."
+            exit 1
+          fi
+
+          rm -rf deploy
+          mkdir -p deploy/.next/static
+
+          cp -a .next/standalone/. deploy/
+
+          if [ -d ".next/static" ]; then
+            cp -a .next/static/. deploy/.next/static/
+          fi
+
+          if [ -d "public" ]; then
+            cp -a public deploy/public
+          fi
+
+          tar -czf "deploy-${GITHUB_RUN_ID}.tar.gz" -C deploy .
+          ls -lh "deploy-${GITHUB_RUN_ID}.tar.gz"
+
+      - name: Create repository upload directory
+        if: ${{ inputs.operation == 'deploy' }}
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_SSH_PORT || 22 }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          script_stop: true
+          script: |
+            mkdir -p "/var/www/gha-deployments/${{ github.repository }}"
+
+      - name: Upload build to VPS
+        if: ${{ inputs.operation == 'deploy' }}
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_SSH_PORT || 22 }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          source: "deploy-${{ github.run_id }}.tar.gz"
+          target: "/var/www/gha-deployments/${{ github.repository }}/"
+
+      # ------------------------------------------------------------------
+      # Remote operation: deploy / update_domains / renew_ssl
+      # ------------------------------------------------------------------
+
+      - name: Run operation on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          OPERATION: ${{ inputs.operation }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRIMARY_DOMAIN: ${{ inputs.primary_domain }}
+          ADDITIONAL_DOMAINS: ${{ inputs.additional_domains }}
+          REDIRECT_ALIASES: ${{ inputs.redirect_aliases }}
+          CERTBOT_EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_SSH_PORT || 22 }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          command_timeout: 30m
+          script_stop: true
+          envs: OPERATION,REPOSITORY,RUN_ID,RUN_ATTEMPT,PRIMARY_DOMAIN,ADDITIONAL_DOMAINS,REDIRECT_ALIASES,CERTBOT_EMAIL
+          script: |
+            set -Eeuo pipefail
+            export LC_ALL=C
+            export PATH="/root/.nvm/versions/node/v22.17.1/bin:$PATH"
+
+            log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+            die() { echo "ERROR: $*" >&2; exit 1; }
+
+            for tool in pm2 node nginx certbot curl openssl flock ss python3; do
+              command -v "$tool" >/dev/null 2>&1 || die "Required tool not found on VPS: $tool"
+            done
+
+            # One deployment at a time across ALL repositories on this VPS
+            # (protects port allocation and Nginx edits).
+            mkdir -p /var/lock
+            exec 9>/var/lock/gha-nextjs-deploy.lock
+            flock -w 900 9 || die "Could not obtain the deployment lock within 15 minutes."
+
+            # ------------------------------------------------------------
+            # Operation: renew_ssl (global, no domain inputs needed)
+            # ------------------------------------------------------------
+            if [ "$OPERATION" = "renew_ssl" ]; then
+              if [ ! -x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx ]; then
+                log "WARNING: Certbot deploy hook /etc/letsencrypt/renewal-hooks/deploy/reload-nginx is missing."
+              fi
+              log "Running certbot renew for ALL certificates on this VPS..."
+              certbot renew --quiet
+              log "certbot renew finished."
+              certbot certificates 2>/dev/null | grep -E 'Certificate Name|Expiry Date' || true
+              exit 0
+            fi
+
+            [ "$OPERATION" = "deploy" ] || [ "$OPERATION" = "update_domains" ] || die "Unknown operation: $OPERATION"
+            [ -n "${CERTBOT_EMAIL:-}" ] || die "CERTBOT_EMAIL secret is required."
+
+            # ------------------------------------------------------------
+            # Identity and paths
+            # ------------------------------------------------------------
+            REPO_LC=$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')
+            APP_ID=$(printf '%s' "$REPO_LC" | sed -E 's#[^a-z0-9]+#-#g; s#^-+##; s#-+$##')
+            [ -n "$APP_ID" ] || die "Could not derive an application ID from $REPOSITORY"
+
+            APPS_ROOT="/var/www/gha-apps"
+            BASE="$APPS_ROOT/$APP_ID"
+            RELEASES="$BASE/releases"
+            METADATA="$BASE/metadata"
+            CURRENT="$BASE/current"
+            ECOSYSTEM="$BASE/ecosystem.config.cjs"
+
+            UPLOAD_DIR="/var/www/gha-deployments/$REPOSITORY"
+            ARCHIVE=""
+            NEW_RELEASE=""
+            PRE_PID=""
+            TMP_ITEMS=()
+
+            NGINX_AVAILABLE="/etc/nginx/sites-available/$APP_ID"
+            NGINX_ENABLED="/etc/nginx/sites-enabled/$APP_ID"
+            CERT_DIR="/etc/letsencrypt/live/$APP_ID"
+            MARKER="# managed-by: gha-nextjs-deploy repo=$REPO_LC"
+
+            cleanup() {
+              local rc=$?
+              if [ -n "$PRE_PID" ]; then kill "$PRE_PID" 2>/dev/null || true; fi
+              if [ -n "$ARCHIVE" ]; then rm -f -- "$ARCHIVE"; fi
+              if [ "${#TMP_ITEMS[@]}" -gt 0 ]; then rm -rf -- "${TMP_ITEMS[@]}"; fi
+              if [ "$rc" -ne 0 ] && [ -n "$NEW_RELEASE" ] && [ -d "$NEW_RELEASE" ]; then
+                if [ "$(readlink -f "$CURRENT" 2>/dev/null || true)" != "$NEW_RELEASE" ]; then
+                  rm -rf -- "$NEW_RELEASE"
+                fi
+              fi
+              exit "$rc"
+            }
+            trap cleanup EXIT
+
+            mkdir -p "$APPS_ROOT" /var/www/letsencrypt
+
+            # Two different repositories must never share one APP_ID.
+            if [ -f "$METADATA/repository" ] && [ "$(cat "$METADATA/repository")" != "$REPO_LC" ]; then
+              die "App ID $APP_ID already belongs to another repository ($(cat "$METADATA/repository"))."
+            fi
+
+            mkdir -p "$RELEASES" "$METADATA"
+            echo "$REPO_LC" > "$METADATA/repository"
+
+            DEPLOYED=false
+            if [ -s "$METADATA/domains" ] && [ -s "$METADATA/port" ] && [ -L "$CURRENT" ]; then
+              DEPLOYED=true
+            fi
+
+            # Never touch Nginx files this workflow did not create.
+            if [ -e "$NGINX_AVAILABLE" ] || [ -L "$NGINX_AVAILABLE" ]; then
+              grep -qxF "$MARKER" "$NGINX_AVAILABLE" \
+                || die "$NGINX_AVAILABLE exists but is not managed by this workflow. Refusing to overwrite it."
+            fi
+            if [ -e "$NGINX_ENABLED" ] || [ -L "$NGINX_ENABLED" ]; then
+              [ "$(readlink -f "$NGINX_ENABLED")" = "$(readlink -f "$NGINX_AVAILABLE")" ] \
+                || die "$NGINX_ENABLED exists but does not point to $NGINX_AVAILABLE. Refusing to overwrite it."
+            fi
+
+            # ------------------------------------------------------------
+            # Domain handling
+            # ------------------------------------------------------------
+            valid_domain() {
+              local d="$1"
+              [ "${#d}" -le 253 ] || return 1
+              [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$ ]] || return 1
+              [[ "${d##*.}" =~ [a-z] ]] || return 1
+            }
+
+            REDIRECT="${REDIRECT_ALIASES:-true}"
+            PRIMARY=""
+            DOMAINS=()
+
+            if [ -n "${PRIMARY_DOMAIN:-}" ] || [ -n "${ADDITIONAL_DOMAINS:-}" ]; then
+              PRIMARY=$(printf '%s' "${PRIMARY_DOMAIN:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+              [ -n "$PRIMARY" ] || die "primary_domain is required when additional domains are supplied."
+              mapfile -t EXTRA < <(printf '%s' "${ADDITIONAL_DOMAINS:-}" | tr '[:upper:]' '[:lower:]' | tr -s ',; \t\r\n' '\n' | sed '/^$/d')
+              DOMAINS=("$PRIMARY")
+              for d in "${EXTRA[@]}"; do DOMAINS+=("$d"); done
+              mapfile -t DOMAINS < <(printf '%s\n' "${DOMAINS[@]}" | awk '!seen[$0]++')
+              for d in "${DOMAINS[@]}"; do
+                valid_domain "$d" || die "Invalid domain name: $d"
+              done
+            fi
+
+            if [ "$OPERATION" = "update_domains" ]; then
+              [ "$DEPLOYED" = true ] || die "This repository has not been deployed yet. Run 'deploy' first."
+              [ -n "$PRIMARY" ] || die "primary_domain is required for update_domains."
+            fi
+
+            if [ "$OPERATION" = "deploy" ]; then
+              if [ "$DEPLOYED" = true ]; then
+                if [ -z "$PRIMARY" ]; then
+                  PRIMARY=$(cat "$METADATA/primary_domain")
+                  mapfile -t DOMAINS < "$METADATA/domains"
+                else
+                  if [ "$(sort -u "$METADATA/domains")" != "$(printf '%s\n' "${DOMAINS[@]}" | sort -u)" ] \
+                     || [ "$(cat "$METADATA/primary_domain")" != "$PRIMARY" ]; then
+                    die "Domains differ from the deployed configuration. Use operation 'update_domains' to change them."
+                  fi
+                fi
+                [ -f "$METADATA/redirect_aliases" ] && REDIRECT=$(cat "$METADATA/redirect_aliases")
+              else
+                [ -n "$PRIMARY" ] || die "primary_domain is required for the first deployment."
+              fi
+            fi
+
+            # Conflict detection against every OTHER Nginx config on the VPS.
+            check_domain_conflicts() {
+              local dump others tok d
+              dump=$(nginx -T 2>/dev/null) || die "'nginx -T' failed; fix the existing Nginx configuration first."
+              others=$(printf '%s\n' "$dump" | awk -v a="$NGINX_AVAILABLE" -v e="$NGINX_ENABLED" '
+                /^# configuration file / {
+                  f=$0; sub(/^# configuration file /,"",f); sub(/:$/,"",f)
+                  skip=(f==a || f==e); next
+                }
+                skip { next }
+                {
+                  line=$0; sub(/#.*/,"",line); gsub(/;/," ",line)
+                  n=split(line,t,/[ \t]+/)
+                  j=1; while (j<=n && t[j]=="") j++
+                  if (t[j]=="server_name") for (i=j+1;i<=n;i++) if (t[i]!="") print t[i]
+                }')
+              while IFS= read -r tok; do
+                [ -n "$tok" ] || continue
+                [ "$tok" = "_" ] && continue
+                for d in "${DOMAINS[@]}"; do
+                  # shellcheck disable=SC2053
+                  if [[ "$d" == $tok ]]; then
+                    die "Domain $d is already served by another Nginx configuration (server_name $tok)."
+                  fi
+                done
+              done <<< "$others"
+            }
+
+            # ------------------------------------------------------------
+            # Nginx and Certbot helpers
+            # ------------------------------------------------------------
+            nginx_http_block() {
+              local names="$1" action="$2"
+              cat <<EOF
+
+            server {
+                listen 80;
+                listen [::]:80;
+                server_name $names;
+
+                location ^~ /.well-known/acme-challenge/ {
+                    root /var/www/letsencrypt;
+                    default_type text/plain;
+                }
+
+                location / {
+                    $action
+                }
+            }
+            EOF
+            }
+
+            nginx_https_proxy() {
+              local names="$1"
+              cat <<EOF
+
+            server {
+                listen 443 ssl;
+                listen [::]:443 ssl;
+                server_name $names;
+
+                ssl_certificate $CERT_DIR/fullchain.pem;
+                ssl_certificate_key $CERT_DIR/privkey.pem;
+                ssl_protocols TLSv1.2 TLSv1.3;
+
+                location / {
+                    proxy_pass http://127.0.0.1:$PORT;
+                    proxy_http_version 1.1;
+
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+
+                    proxy_set_header Upgrade \$http_upgrade;
+                    proxy_set_header Connection "upgrade";
+                }
+            }
+            EOF
+            }
+
+            nginx_https_redirect() {
+              local names="$1"
+              cat <<EOF
+
+            server {
+                listen 443 ssl;
+                listen [::]:443 ssl;
+                server_name $names;
+
+                ssl_certificate $CERT_DIR/fullchain.pem;
+                ssl_certificate_key $CERT_DIR/privkey.pem;
+                ssl_protocols TLSv1.2 TLSv1.3;
+
+                return 301 https://$PRIMARY\$request_uri;
+            }
+            EOF
+            }
+
+            write_nginx() {
+              local mode="$1" all aliases=() alias_names d redirect=false
+              all="${DOMAINS[*]}"
+              for d in "${DOMAINS[@]:1}"; do aliases+=("$d"); done
+              alias_names="${aliases[*]:-}"
+              if [ "$REDIRECT" = "true" ] && [ "${#aliases[@]}" -gt 0 ]; then redirect=true; fi
+
+              {
+                echo "$MARKER"
+                echo "# app=$APP_ID port=$PORT (generated by GitHub Actions; manual edits will be overwritten)"
+                if [ "$mode" = "nossl" ]; then
+                  nginx_http_block "$all" "return 404;"
+                elif [ "$redirect" = true ]; then
+                  nginx_http_block "$PRIMARY" "return 301 https://\$host\$request_uri;"
+                  nginx_http_block "$alias_names" "return 301 https://$PRIMARY\$request_uri;"
+                  nginx_https_proxy "$PRIMARY"
+                  nginx_https_redirect "$alias_names"
+                else
+                  nginx_http_block "$all" "return 301 https://\$host\$request_uri;"
+                  nginx_https_proxy "$all"
+                fi
+              } > "$NGINX_AVAILABLE"
+            }
+
+            apply_nginx() {
+              write_nginx "$1" || return 1
+              ln -sfn "$NGINX_AVAILABLE" "$NGINX_ENABLED" || return 1
+              nginx -t || return 1
+              systemctl reload nginx || return 1
+            }
+
+            BACKUP_DIR=""
+            HAD_CONF=false
+            backup_nginx() {
+              BACKUP_DIR=$(mktemp -d)
+              TMP_ITEMS+=("$BACKUP_DIR")
+              if [ -f "$NGINX_AVAILABLE" ]; then
+                cp -a "$NGINX_AVAILABLE" "$BACKUP_DIR/conf"
+                HAD_CONF=true
+              fi
+            }
+
+            restore_nginx() {
+              log "Restoring the previous Nginx configuration..."
+              if [ "$HAD_CONF" = true ]; then
+                cp -a "$BACKUP_DIR/conf" "$NGINX_AVAILABLE"
+                ln -sfn "$NGINX_AVAILABLE" "$NGINX_ENABLED"
+              else
+                rm -f "$NGINX_ENABLED" "$NGINX_AVAILABLE"
+              fi
+              if nginx -t; then systemctl reload nginx || true; fi
+            }
+
+            cert_sans() {
+              openssl x509 -in "$CERT_DIR/fullchain.pem" -noout -text 2>/dev/null \
+                | grep -A1 'Subject Alternative Name' | tail -n1 \
+                | tr ',' '\n' | sed -E 's/^[[:space:]]*DNS://; s/[[:space:]]//g' \
+                | sed '/^$/d' | sort -u
+            }
+
+            # Make the certificate lineage contain EXACTLY the requested names.
+            ensure_cert() {
+              local want have d
+              want=$(printf '%s\n' "${DOMAINS[@]}" | sort -u)
+              have=""
+              if [ -f "$CERT_DIR/fullchain.pem" ]; then have=$(cert_sans || true); fi
+
+              if [ "$have" = "$want" ]; then
+                log "Certificate $APP_ID already covers exactly the requested domains; no issuance needed."
+                return 0
+              fi
+
+              local args=()
+              for d in "${DOMAINS[@]}"; do args+=(-d "$d"); done
+              local common=(certonly --webroot -w /var/www/letsencrypt --cert-name "$APP_ID"
+                            --non-interactive --agree-tos -m "$CERTBOT_EMAIL" --no-eff-email --expand)
+
+              log "Certbot dry run (staging) for: ${DOMAINS[*]}"
+              certbot "${common[@]}" --dry-run "${args[@]}" || return 1
+
+              log "Requesting certificate $APP_ID for: ${DOMAINS[*]}"
+              certbot "${common[@]}" "${args[@]}" || return 1
+
+              have=$(cert_sans || true)
+              if [ "$have" != "$want" ]; then
+                log "Issued certificate names do not match the request."
+                log "Wanted: $(echo "$want" | tr '\n' ' ')"
+                log "Got:    $(echo "$have" | tr '\n' ' ')"
+                return 1
+              fi
+            }
+
+            configure_domains() {
+              backup_nginx
+              local stage=nossl
+              if [ -f "$CERT_DIR/fullchain.pem" ] && [ -f "$CERT_DIR/privkey.pem" ]; then stage=ssl; fi
+
+              # Stage 1: serve the ACME challenge for ALL requested names.
+              apply_nginx "$stage" || { restore_nginx; die "Nginx validation failed (stage 1)."; }
+
+              ensure_cert || { restore_nginx; die "Certificate issuance failed. Previous configuration restored."; }
+
+              if [ ! -f "$CERT_DIR/fullchain.pem" ] || [ ! -f "$CERT_DIR/privkey.pem" ]; then
+                restore_nginx
+                die "Certificate files are missing after issuance."
+              fi
+
+              # Stage 2: final HTTPS configuration (reload also loads the new certificate).
+              apply_nginx ssl || { restore_nginx; die "Nginx validation failed (final config). Previous configuration restored."; }
+            }
+
+            save_domain_metadata() {
+              printf '%s\n' "${DOMAINS[@]}" > "$METADATA/domains.tmp"
+              mv -f "$METADATA/domains.tmp" "$METADATA/domains"
+              echo "$PRIMARY" > "$METADATA/primary_domain"
+              echo "$REDIRECT" > "$METADATA/redirect_aliases"
+            }
+
+            # ------------------------------------------------------------
+            # Operation: update_domains
+            # ------------------------------------------------------------
+            if [ "$OPERATION" = "update_domains" ]; then
+              PORT=$(cat "$METADATA/port")
+              log "Application: $APP_ID (port $PORT, unchanged)"
+              log "New domains: ${DOMAINS[*]}"
+
+              check_domain_conflicts
+              configure_domains
+              save_domain_metadata
+
+              echo "--------------------------------------"
+              echo "DOMAINS UPDATED"
+              echo "Application: $APP_ID"
+              echo "Website: https://$PRIMARY"
+              echo "--------------------------------------"
+              exit 0
+            fi
+
+            # ------------------------------------------------------------
+            # Operation: deploy
+            # ------------------------------------------------------------
+            ARCHIVE="$UPLOAD_DIR/deploy-$RUN_ID.tar.gz"
+            [ -f "$ARCHIVE" ] || die "Deployment archive not found: $ARCHIVE"
+
+            allocate_port() {
+              local used c
+              used=$( {
+                cat "$APPS_ROOT"/*/metadata/port 2>/dev/null || true
+                nginx -T 2>/dev/null | grep -oE '(127\.0\.0\.1|localhost|\[::1\]):[0-9]+' | grep -oE '[0-9]+$' || true
+                pm2 jlist 2>/dev/null | grep -oE '"PORT":"?[0-9]+' | grep -oE '[0-9]+$' || true
+              } | sort -u ) || true
+              for c in $(seq 3100 3999); do
+                if grep -qx "$c" <<< "$used"; then continue; fi
+                if [ -n "$(ss -H -ltn "sport = :$c" 2>/dev/null)" ]; then continue; fi
+                echo "$c"
+                return 0
+              done
+              return 1
+            }
+
+            if [ "$DEPLOYED" = true ]; then
+              PORT=$(cat "$METADATA/port")
+            else
+              check_domain_conflicts
+              if [ ! -s "$METADATA/port" ]; then
+                PM2_LIST=$(pm2 jlist 2>/dev/null || true)
+                if grep -qF "\"name\":\"$APP_ID\"" <<< "$PM2_LIST"; then
+                  die "A PM2 process named $APP_ID already exists but is not managed by this workflow."
+                fi
+                PORT=$(allocate_port) || die "No free port available in 3100-3999."
+                echo "$PORT" > "$METADATA/port"
+              else
+                PORT=$(cat "$METADATA/port")
+              fi
+            fi
+
+            log "Application: $APP_ID"
+            log "Port: $PORT"
+            log "Domains: ${DOMAINS[*]}"
+
+            # Extract the new release (not active yet).
+            NEW_RELEASE="$RELEASES/$RUN_ID-$RUN_ATTEMPT"
+            rm -rf -- "$NEW_RELEASE"
+            mkdir -p "$NEW_RELEASE"
+            tar -xzf "$ARCHIVE" -C "$NEW_RELEASE"
+            [ -f "$NEW_RELEASE/server.js" ] || die "server.js missing in the uploaded release."
+
+            wait_healthy() {
+              local port="$1" tries="$2" code i
+              for i in $(seq 1 "$tries"); do
+                code=$(curl -sS -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)
+                if [ -n "$code" ] && [ "$code" != "000" ] && [ "$code" -lt 500 ]; then return 0; fi
+                sleep 2
+              done
+              return 1
+            }
+
+            # Pre-flight: boot the new release on a throw-away port BEFORE switching.
+            TMP_PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+            PRE_LOG=$(mktemp)
+            TMP_ITEMS+=("$PRE_LOG")
+            log "Pre-flight start on temporary port $TMP_PORT"
+            ( cd "$NEW_RELEASE" && exec env NODE_ENV=production PORT="$TMP_PORT" HOSTNAME=127.0.0.1 node server.js ) >"$PRE_LOG" 2>&1 &
+            PRE_PID=$!
+            if ! wait_healthy "$TMP_PORT" 20; then
+              echo "---- pre-flight log ----"; tail -n 40 "$PRE_LOG" || true
+              die "New release failed its pre-flight check. Nothing was changed."
+            fi
+            kill "$PRE_PID" 2>/dev/null || true
+            wait "$PRE_PID" 2>/dev/null || true
+            PRE_PID=""
+
+            # Switch release atomically, then reload PM2.
+            switch_current() {
+              ln -sfn "$1" "$BASE/current.tmp"
+              mv -Tf "$BASE/current.tmp" "$CURRENT"
+            }
+
+            OLD_RELEASE=""
+            if [ -L "$CURRENT" ]; then OLD_RELEASE=$(readlink -f "$CURRENT"); fi
+
+            cat > "$ECOSYSTEM.tmp" <<EOF
+            module.exports = {
+              apps: [
+                {
+                  name: "$APP_ID",
+                  script: "$CURRENT/server.js",
+                  cwd: "$CURRENT",
+                  instances: 1,
+                  exec_mode: "fork",
+                  env: {
+                    NODE_ENV: "production",
+                    PORT: "$PORT",
+                    HOSTNAME: "127.0.0.1"
+                  }
+                }
+              ]
+            };
+            EOF
+            mv -f "$ECOSYSTEM.tmp" "$ECOSYSTEM"
+
+            rollback_release() {
+              log "Rolling back to the previous release..."
+              if [ -n "$OLD_RELEASE" ] && [ -d "$OLD_RELEASE" ]; then
+                switch_current "$OLD_RELEASE"
+                pm2 startOrReload "$ECOSYSTEM" --update-env || true
+              else
+                pm2 delete "$APP_ID" >/dev/null 2>&1 || true
+                rm -f "$CURRENT"
+              fi
+              pm2 save || true
+            }
+
+            switch_current "$NEW_RELEASE"
+            if ! pm2 startOrReload "$ECOSYSTEM" --update-env; then
+              rollback_release
+              die "PM2 failed to start the new release."
+            fi
+
+            if ! wait_healthy "$PORT" 30; then
+              pm2 logs "$APP_ID" --lines 30 --nostream 2>/dev/null || true
+              rollback_release
+              die "Health check failed on port $PORT. Previous release restored."
+            fi
+            pm2 save
+            log "Release $(basename "$NEW_RELEASE") is live on port $PORT."
+
+            # First deployment only: Nginx and SSL.
+            if [ "$DEPLOYED" != true ]; then
+              configure_domains
+              save_domain_metadata
+            fi
+
+            # Keep the newest 3 releases (plus current and previous).
+            CUR=$(readlink -f "$CURRENT")
+            ls -1dt "$RELEASES"/*/ 2>/dev/null | sed 's#/$##' | tail -n +4 | while IFS= read -r old; do
+              [ "$old" = "$CUR" ] && continue
+              [ -n "$OLD_RELEASE" ] && [ "$old" = "$OLD_RELEASE" ] && continue
+              rm -rf -- "$old"
+            done || true
+
+            echo "--------------------------------------"
+            echo "DEPLOYMENT SUCCESSFUL"
+            echo "Application: $APP_ID"
+            echo "Port: $PORT"
+            echo "Website: https://$PRIMARY"
+            echo "--------------------------------------"
