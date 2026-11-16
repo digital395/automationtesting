@@ -164,6 +164,8 @@ jobs:
           envs: OPERATION,REPOSITORY,RUN_ID,RUN_ATTEMPT,PRIMARY_DOMAIN,ADDITIONAL_DOMAINS,REDIRECT_ALIASES,CERTBOT_EMAIL
           script: |
             set -Eeuo pipefail
+            trap 'rc=$?; echo "FAILED at line ${LINENO}: ${BASH_COMMAND} (exit: $rc)" >&2' ERR
+            set -x
             export LC_ALL=C
             export PATH="/root/.nvm/versions/node/v22.17.1/bin:$PATH"
 
